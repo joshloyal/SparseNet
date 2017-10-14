@@ -4,7 +4,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.preprocessing import StandardScaler
 
 
-__all__ = ['soft_threshold', 'lasso_cd', 'lasso_path', 'LassoRegressor']
+__all__ = ['soft_threshold', 'enet_cd', 'enet_path', 'ElasticNetRegressor']
 
 
 def soft_threshold(beta, reg_lambda):
@@ -39,32 +39,42 @@ def should_stop(loss, iter_idx, tol = 1e-5):
     return False
 
 
-def lasso_cd(X, y, reg_lambda, beta=None, tol=1e-5, max_iter=500, patience=5):
+def enet_cd(X, y, lambda_l1, lambda_l2=0, weight=None,
+            norm_cols_X=None, tol=1e-5, max_iter=500, patience=5):
+    """minimizes
+
+    (1/2N * norm(y - X weight, 2)^2 + \
+        (lambda_l1 * norm(weight, 1) + (lambda_l2/2) * norm(weight, 2)^2
+    """
     # default beta is all zeros
     _, n_features = X.shape
-    if beta is None:
-        beta = np.zeros(n_features)
+    if weight is None:
+        weight = np.zeros(n_features)
+
+    if norm_cols_X is None:
+        norm_cols_X = np.mean(X**2, axis=0)
 
     # value of the objective function at each iteration
     loss = np.zeros(max_iter)
 
     for k in range(0, max_iter):
         # the full residual used to check the value of the loss function
-        residual = y - np.dot(X, beta)
+        residual = y - np.dot(X, weight)
         loss[k] = np.mean(residual**2)
 
         for j in range(0, n_features):
             # partial residual (effect of all the other co-variates
-            residual = residual + X[:, j] * beta[j]
+            residual = residual + X[:, j] * weight[j]
 
             # single variable OLS estimate
-            beta_ols_j = np.mean(residual * X[:, j])
+            weight_ols_j = np.mean(residual * X[:, j])
 
             # soft-threshold the result
-            beta[j] = soft_threshold(beta_ols_j, reg_lambda)
+            weight[j] = soft_threshold(weight_ols_j, lambda_l1)
+            weight[j] /= (norm_cols_X[j] + lambda_l2)
 
             # restore the residual
-            residual = residual - X[:, j] * beta[j]
+            residual = residual - X[:, j] * weight[j]
         # end-of coefficient loop
 
         # check if we should stop
@@ -72,11 +82,12 @@ def lasso_cd(X, y, reg_lambda, beta=None, tol=1e-5, max_iter=500, patience=5):
             break
     # end-of iteration loop
 
-    return beta
+    return weight
 
 
-def lasso_path(X, y, lambda_path=None, n_lambda=100, lambda_ratio=1e-4,
-               max_iter=500, tol=1e-5, patience=5, scale_Xy=True):
+def enet_path(X, y, lambda_path=None, n_lambda=100, lambda_ratio=1e-4,
+              alpha=1, distribution='gaussian', max_iter=500, tol=1e-5,
+              patience=5, scale_Xy=True):
     n_samples, n_features = X.shape
 
     if scale_Xy:
@@ -99,31 +110,43 @@ def lasso_path(X, y, lambda_path=None, n_lambda=100, lambda_ratio=1e-4,
         n_lambda = lambda_path.shape[0]
 
     # the coefficients for each lambda value
-    betas = np.empty((n_features, n_lambda))
+    weights = np.empty((n_features, n_lambda))
     intercepts = np.zeros(n_lambda)
-    bhat = np.zeros(n_features)
+    what = np.zeros(n_features)
 
     for i in range(n_lambda):
-        bhat = lasso_cd(X, y, lambda_path[i], beta=bhat, tol=tol, max_iter=max_iter,
-                        patience=patience)
+        lambda_l1 = lambda_path[i] * alpha
+        lambda_l2 = lambda_path[i] * (1 - alpha)
+
+        if distribution == 'gaussian':
+            what = enet_cd(X, y, lambda_l1=lambda_l1, lambda_l2=lambda_l2,
+                           weight=what, tol=tol, max_iter=max_iter,
+                           patience=patience)
+        else:
+            raise NotImplementedError
 
         if scale_Xy:
             # to get the unscaled / uncentered version of the cofficients we
             # need to apply the scale to the coefficients
             # Note: x_new = x_old * center + scale => beta_new = beta_old / center.
-            betas[:, i] = bhat / x_scaler.scale_
+            weights[:, i] = what / x_scaler.scale_
 
             # we can always calcuale the intercept from the other coefficients
             # Note: beta0 = ybar - sum(xbar_i * beta_i)
-            intercepts[i] = y_scaler.mean_ - sum(x_scaler.mean_ * betas[:, i])
+            intercepts[i] = y_scaler.mean_ - sum(x_scaler.mean_ * weights[:, i])
         else:
-            betas[:, i] = bhat
+            weights[:, i] = what
     # end-of lambda path
 
-    return betas, intercepts, lambda_path
+    return weights, intercepts, lambda_path
 
 
-class LassoRegressor(BaseEstimator, RegressorMixin):
+class ElasticNetRegressor(BaseEstimator, RegressorMixin):
+    """minimizes
+
+    (1/2N * norm(y - X w, 2)^2 + \
+        lambda * (alpha norm(w, 1) + (1/2) * (1 - alpha) * norm(w, 2)^2
+    """
     def __init__(self, lambda_path='auto', n_lambda=100,
                  lambda_ratio=1e-4, max_iter=500, tol=1e-5, patience=5,
                  scale_Xy=True, alpha=1):
@@ -140,14 +163,15 @@ class LassoRegressor(BaseEstimator, RegressorMixin):
     def fit(self, X, y):
         (coefs,
          intercepts,
-         lambda_path) = lasso_path(X, y,
-                                   lambda_path=self.lambda_path,
-                                   n_lambda=self.n_lambda,
-                                   lambda_ratio=self.lambda_ratio,
-                                   max_iter=self.max_iter,
-                                   tol=self.tol,
-                                   patience=self.patience,
-                                   scale_Xy=self.scale_Xy)
+         lambda_path) = enet_path(X, y,
+                                  lambda_path=self.lambda_path,
+                                  n_lambda=self.n_lambda,
+                                  lambda_ratio=self.lambda_ratio,
+                                  alpha=self.alpha,
+                                  max_iter=self.max_iter,
+                                  tol=self.tol,
+                                  patience=self.patience,
+                                  scale_Xy=self.scale_Xy)
 
         self.coefs_ = coefs  # [n_features, n_lambda]
         self.intercepts_ = intercepts  # [n_lambda]
