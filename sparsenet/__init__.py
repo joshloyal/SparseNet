@@ -1,1 +1,1 @@
-from lasso import *
+from sparsenet.lasso import *
